@@ -1,0 +1,271 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="theme-color" content="#ffffff">
+<title>ハト</title>
+<link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><text y='.9em' font-size='90'>🕊️</text></svg>">
+<style>
+  :root { color-scheme: light; }
+  * { box-sizing: border-box; }
+  html, body { margin: 0; height: 100%; background: #fff; }
+  body {
+    display: flex; align-items: center; justify-content: center;
+    font-family: -apple-system, "Hiragino Sans", "Yu Gothic", "Noto Sans JP", sans-serif;
+    color: #888; -webkit-tap-highlight-color: transparent;
+  }
+  main { width: 100%; display: flex; flex-direction: column; align-items: center; padding: 0 0 8vh; }
+
+  .stage { position: relative; width: min(92vw, 420px); aspect-ratio: 400 / 240; transition: opacity 1.5s ease; }
+  .stage svg.backdrop { position: absolute; inset: 0; width: 100%; height: 100%; transition: opacity .6s ease; }
+
+  .pigeon {
+    position: absolute; left: 50%; top: 33.333%; width: 30%;
+    transform: translateX(-50%) scale(1); transform-origin: 50% 88%;
+    transition: transform 1.5s ease;
+  }
+  .pigeon svg { display: block; width: 100%; height: auto; animation: bob 2.6s ease-in-out infinite alternate; }
+  .pigeon.second { display: none; }
+  .stage.near .pigeon.first { transform: translateX(-50%) scale(1.4); }
+  .stage.double .pigeon.first { transform: translateX(-20%) scale(1); }
+  .stage.double .pigeon.second { display: block; transform: translateX(-125%) scale(.8); }
+  @keyframes bob { from { translate: 0 0; } to { translate: 0 -2px; } }
+
+  .name {
+    margin: 28px 0 0; padding: 4px 8px; border: 0; background: none; cursor: pointer;
+    font: 20px/1.4 ui-rounded, "Hiragino Maru Gothic ProN", -apple-system, sans-serif; color: #333;
+    transition: opacity 1.5s ease;
+  }
+  .name-input {
+    margin: 28px 0 0; width: 9em; text-align: center; border: 0; border-bottom: 1px solid #ccc; outline: 0;
+    font: 20px/1.4 ui-rounded, "Hiragino Maru Gothic ProN", -apple-system, sans-serif; color: #333; background: none;
+  }
+  .status { margin: 10px 0 0; min-height: 1.6em; font-size: 15px; font-weight: 300; letter-spacing: .08em; transition: opacity .6s ease, transform 1.5s ease; }
+
+  body.away .stage, body.away .name { opacity: 0; pointer-events: none; }
+  body.away .status { transform: translateY(-9.5rem); }
+
+  @media (prefers-reduced-motion: reduce) {
+    .pigeon svg { animation: none; }
+    * { transition-duration: .01s !important; }
+  }
+</style>
+</head>
+<body>
+<main>
+  <div class="stage" id="stage">
+    <svg class="backdrop" id="backdrop" viewBox="0 0 400 240" aria-hidden="true"></svg>
+    <div class="pigeon second" aria-hidden="true"></div>
+    <div class="pigeon first" role="img" aria-label="ハト"></div>
+  </div>
+  <div id="nameWrap"><button class="name" id="name" type="button"></button></div>
+  <p class="status" id="status" aria-live="polite"></p>
+</main>
+
+<script>
+(() => {
+  "use strict";
+
+  /* ---------- 文言（増減自由。意味はない） ---------- */
+  const COMMON = [
+    ["ぼんやりしています", 10], ["地面を見ています", 10], ["遠くを見ています", 8],
+    ["眠そうです", 8], ["なにか考えています", 6], ["小枝を持っています", 4],
+    ["少し偉そうです", 4], ["見られていることに気付きました", 3], ["首を動かしています", 6],
+    ["特に何もしていません", 6], ["羽を整えています", 4]
+  ];
+  const AWAY = "ハトはどこかへ行きました";
+  const RETURNS = ["帰っていました", "いました", "特に説明はありません", "元気そうです"];
+  const RARES = [
+    ["watching", "ハトがこちらを見ています"], ["near", "今日は少し近いです"],
+    ["remember", "あなたを覚えている気がします"], ["double", "ハトが2羽になっています"]
+  ];
+  const EPILOGUE = "元に戻っています";
+  const SCENES = ["park", "wire", "station", "river"];
+
+  /* ---------- 調整用パラメータ ---------- */
+  const H = 36e5, D = 864e5;
+  const CFG = {
+    escapePerHour: 0.003,        // 閉じている間の逃走確率（1時間あたり、上限24時間分）
+    escapePerTick: 0.0003,       // 眺めている最中の逃走確率（一言ごと）
+    returnMin: 18 * H, returnMax: 5 * D,
+    rareChance: 0.006,           // 一言が変わるたびのレア確率
+    sceneReroll: 30 * 6e4,
+    tickMin: 10000, tickMax: 30000
+  };
+
+  /* ---------- 保存 ---------- */
+  const KEY = "hato.state.v1";
+  const fresh = () => ({
+    name: "ポッポ", scene: "park", text: "ぼんやりしています",
+    away: false, returnAt: null, rare: null, rareUntil: null,
+    lastChecked: Date.now(), sceneChangedAt: Date.now(), awayCount: 0
+  });
+  let S;
+  try { S = Object.assign(fresh(), JSON.parse(localStorage.getItem(KEY) || "{}")); } catch (e) { S = fresh(); }
+  const save = () => { try { localStorage.setItem(KEY, JSON.stringify(S)); } catch (e) {} };
+
+  /* ---------- ロジック ---------- */
+  const rnd = (a, b) => a + Math.random() * (b - a);
+  const choice = arr => arr[Math.floor(Math.random() * arr.length)];
+
+  function pickPhrase(exclude) {
+    const pool = COMMON.filter(p => p[0] !== exclude);
+    let r = Math.random() * pool.reduce((n, p) => n + p[1], 0);
+    for (const [t, w] of pool) { r -= w; if (r < 0) return t; }
+    return pool[0][0];
+  }
+  function leave(now) {
+    S.away = true; S.awayCount++; S.returnAt = now + rnd(CFG.returnMin, CFG.returnMax);
+    S.rare = null; S.rareUntil = null; S.text = AWAY;
+  }
+  function comeBack(now) {
+    S.away = false; S.returnAt = null; S.scene = choice(SCENES); S.sceneChangedAt = now; S.text = choice(RETURNS);
+  }
+  // 2羽 → 元に戻る。戻したら true
+  function expireRare(now) {
+    if (S.rareUntil && now >= S.rareUntil) {
+      const wasDouble = S.rare === "double";
+      S.rare = null; S.rareUntil = null;
+      if (wasDouble) { S.text = EPILOGUE; return true; }
+    }
+    return false;
+  }
+  function changePhrase(now) {
+    if (!S.rare && Math.random() < CFG.rareChance) {
+      const [kind, text] = choice(RARES);
+      S.rare = kind; S.text = text;
+      S.rareUntil = kind === "near" ? now + 3 * H : kind === "double" ? now + rnd(20 * H, 30 * H) : null;
+      return;
+    }
+    S.text = pickPhrase(S.text);
+  }
+
+  // タブが開かれた／戻ってきたとき：経過時間ぶんをまとめて判定
+  function refresh() {
+    const now = Date.now();
+    if (S.away) {
+      if (S.returnAt && now >= S.returnAt) comeBack(now);
+    } else if (!expireRare(now)) {
+      const hours = Math.min(Math.max(now - S.lastChecked, 0) / H, 24);
+      if (Math.random() < 1 - Math.pow(1 - CFG.escapePerHour, hours)) {
+        leave(now);
+      } else {
+        if (now - S.sceneChangedAt > CFG.sceneReroll && Math.random() < 0.5) {
+          S.scene = choice(SCENES.filter(x => x !== S.scene)); S.sceneChangedAt = now;
+        }
+        changePhrase(now);
+      }
+    }
+    S.lastChecked = now; save(); render();
+  }
+
+  // 眺めている間、10〜30秒ごと
+  let timer = null;
+  function tick() {
+    const now = Date.now();
+    if (S.away) {
+      if (S.returnAt && now >= S.returnAt) comeBack(now);
+    } else {
+      S.lastChecked = now;
+      if (Math.random() < CFG.escapePerTick) leave(now);
+      else if (!expireRare(now)) {
+        if (S.rare === "watching" || S.rare === "remember") S.rare = null;
+        changePhrase(now);
+      }
+    }
+    save(); render(); schedule();
+  }
+  function schedule() { clearTimeout(timer); timer = setTimeout(tick, rnd(CFG.tickMin, CFG.tickMax)); }
+
+  /* ---------- 描画 ---------- */
+  const $ = id => document.getElementById(id);
+  const stage = $("stage"), backdrop = $("backdrop"), statusEl = $("status"), nameWrap = $("nameWrap");
+
+  const PIGEON = `<svg viewBox="0 0 120 120" aria-hidden="true">
+    <path d="M50 88V106M62 88V106" stroke="#d98c80" stroke-width="2.5" stroke-linecap="round" fill="none"/>
+    <polygon points="26,64 6,78 28,82" fill="#808080"/>
+    <ellipse cx="57" cy="72" rx="35" ry="20" fill="#adadad"/>
+    <ellipse cx="55" cy="69" rx="21" ry="11" fill="#8c8c8c"/>
+    <ellipse cx="79" cy="59" rx="13" ry="17" fill="#808fa8"/>
+    <ellipse cx="85" cy="45" rx="13" ry="13" fill="#adadad"/>
+    <polygon points="96,43 108,48 96,52" fill="#595959"/>
+    <circle cx="88.3" cy="43.3" r="2.3" fill="#000"/></svg>`;
+  document.querySelectorAll(".pigeon").forEach(el => (el.innerHTML = PIGEON));
+
+  function sceneSVG(kind) {
+    const g = 186, line = (x1, y1, x2, y2) => `<path d="M${x1} ${y1}L${x2} ${y2}"/>`;
+    let b = "";
+    if (kind === "park") {
+      b = line(0, g, 400, g) + line(64, g, 64, g - 62) + `<circle cx="64" cy="96" r="30"/>`;
+    } else if (kind === "wire") {
+      b = `<path d="M0 180Q200 192 400 180"/>` + line(360, 180, 360, 0);
+    } else if (kind === "station") {
+      b = line(0, g, 400, g) + `<rect x="32" y="90" width="104" height="96"/>` + line(328, g, 328, g - 70) + `<rect x="312" y="100" width="32" height="16"/>`;
+    } else {
+      b = line(0, g, 400, g);
+      for (let i = 0; i < 3; i++) {
+        const y = g + 16 + i * 16; let d = `M0 ${y}`;
+        for (let x = 0; x < 400; x += 24) d += `Q${x + 12} ${y - 5} ${x + 24} ${y}`;
+        b += `<path d="${d}" opacity=".7"/>`;
+      }
+    }
+    return `<g fill="none" stroke="#d1d1d1" stroke-width="1.2" stroke-linecap="round">${b}</g>`;
+  }
+
+  const shown = { first: true, name: null, text: null, scene: null };
+  const fade = (el, fn) => {
+    clearTimeout(el._t); el.style.opacity = 0;
+    el._t = setTimeout(() => { fn(); el.style.opacity = 1; }, 600);
+  };
+
+  function render() {
+    document.body.classList.toggle("away", S.away);
+    stage.classList.toggle("near", S.rare === "near");
+    stage.classList.toggle("double", S.rare === "double");
+
+    if (S.name !== shown.name) { const n = $("name"); if (n) n.textContent = S.name; shown.name = S.name; }
+
+    if (shown.first) {
+      statusEl.textContent = S.text; backdrop.innerHTML = sceneSVG(S.scene);
+      shown.first = false;
+    } else {
+      if (S.text !== shown.text) fade(statusEl, () => (statusEl.textContent = S.text));
+      if (S.scene !== shown.scene) fade(backdrop, () => (backdrop.innerHTML = sceneSVG(S.scene)));
+    }
+    shown.text = S.text; shown.scene = S.scene;
+  }
+
+  /* ---------- 名前を付ける ---------- */
+  function bindName() {
+    const btn = $("name");
+    btn.addEventListener("click", () => {
+      const input = document.createElement("input");
+      input.className = "name-input"; input.maxLength = 12; input.value = S.name;
+      input.setAttribute("aria-label", "名前");
+      nameWrap.replaceChildren(input); input.focus(); input.select();
+      let done = false;
+      const commit = ok => {
+        if (done) return; done = true;
+        const v = input.value.trim();
+        if (ok && v) { S.name = v.slice(0, 12); save(); }
+        nameWrap.innerHTML = '<button class="name" id="name" type="button"></button>';
+        shown.name = null; bindName(); render();
+      };
+      input.addEventListener("keydown", e => { if (e.key === "Enter") commit(true); if (e.key === "Escape") commit(false); });
+      input.addEventListener("blur", () => commit(true));
+    });
+  }
+
+  /* ---------- 起動 ---------- */
+  bindName();
+  refresh();
+  schedule();
+  document.addEventListener("visibilitychange", () => {
+    if (document.hidden) clearTimeout(timer);
+    else { refresh(); schedule(); }
+  });
+})();
+</script>
+</body>
+</html>
